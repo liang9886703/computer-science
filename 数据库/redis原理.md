@@ -119,11 +119,11 @@ embstr缺点
 
 使用string来缓存对象有两种方式：
 
-- 直接缓存整个对象的JSON，
+- 直接缓存整个对象的JSON
 
-  例：`SET user:1 ‘{“name” : “xiaolin”, “age”:18’`}
+  例：`SET user:1 {“name” : “xiaolin”, “age”:18’`}
 
-- 将key分离为属性，采用mset存储，有mget获取个属性值
+- 将key分离为属性，采用mset存储，由mget获取个属性值
 
   例：MEST user:1:name xiaolin user:1:age 18 
 
@@ -156,6 +156,10 @@ redis是单线程的，命令的执行为原子的，适用访问次数、点赞
 
 ## list类型
 
+可以两头写，无顺序，简单字符串列表，最大长度为2^32-1
+
+### 底层实现
+
 底层为双向链表或压缩列表
 
 - 列表的元素<512个（可配置），并且每个元素的值小于64字节，redis会使用压缩列表
@@ -163,21 +167,206 @@ redis是单线程的，命令的执行为原子的，适用访问次数、点赞
 
 redis 3.2之后，全部由quicklist实现
 
+### 命令
+
+```sql
+# 将一个或多个左值插入key列表的
+LPUSH key value [value……]
+# 将一个或多个左值插入key列表的
+RPUSH key value [value……]
+# 移处左边的元素
+LPOP key
+# 移除右边的元素
+RPOP key
+
+# 返回列表指定区间的元素
+LRANGE key start stop
+
+# 从key列表表头弹出一个元素，没有旧阻塞timeouot秒，==0则一直阻塞
+BLPOP key [key …] timeout
+# 表尾弹出
+BRPOP key [key …] timeout
+```
+
+### 应用场景
+
+1、消息队列
+
+list 和 stream均可实现
+
+存取消息必须满足：**消息保序、处理重复的消息、保证消息可靠性**
+
+**@ 如何满足消息保序需求**
+
+队列先入先出本身能满足消息保序，LPUSH+RPOP(RPUSH+LPOP)
+
+为了生产者能通知消费者，redis提供BRPOP命令阻塞读取，没有读到队列数据时自动阻塞，有新的数据后再读取，比起轮询减少CPU开销
+
+**@ 如何处理重复的消息**
+
+消费者要实现重复的消息判断
+
+- 每个消息有全局ID
+- 消息者要记录处理过的消息ID，重复的不处理
+
+list并不会对每个消息生成ID号，需要程序员在list里包含这个ID
+
+**@ 如何保证消息可靠性**
+
+消费者从list取出消息，list不会保存这个消息，如果消费者故障，则消息没有处理就丢失了
+
+BRPOPLPUSH命令能让消费者程序从一个list中读消息，同时redis将这个消息插入另一个list备份
+
+**@ list存在的缺陷**
+
+不支持多个消费者读同一消息
+
 ## hash类型
+
+hash是键值对的集合，value=[{field1， value1}，……{fieldN, valueN}]
+
+string是一个KV对，hash一个K能存放多个field，对应多个值
+
+![image-20231106092831686](image-20231106092831686.png)
+
+### 底层实现
 
 底层为压缩列表或哈希表
 
 - 列表的元素<512个（可配置），并且每个元素的值小于64字节，redis会使用压缩列表
 - 其他情况用hash表
 
-redis 7.0后压缩列表替换为listpack实现
+redis 7.0后压缩列表替换为**listpack**实现
+
+### 命令
+
+```sql
+# 存储哈希表key的键值
+HSET key:1 field value # 插入一个(1,field,value)
+HMSET key:2 name jerry [age 13 ……] # 插入多个键值
+# 获取哈希表key对应的field键值
+HGET key field # 获取一个field
+HMSET key field [field ……] # 获取多个field
+HGETALL key # 返回哈希表key中所有的键值
+
+# 删除key中的field键值
+HDEL key field [field ……]
+
+# 返回哈希表key中field的数量
+HLEN key
+
+# 为哈希表key中field键的值加上增量n
+HINCRBY key field n
+```
+
+### 应用场景
+
+1、缓存对象
+
+（对象id，属性，值）
+
+string+Json也可以存储对象，一般对象中频繁变化的属性可以抽出来用hash储存
+
+2、购物车
+
+key:(field、value) 对应    用户id：（商品id、数量）
+
+![image-20231106095748087](image-20231106095748087.png)
 
 ## set类型
+
+无序并唯一的键值集合，最多存储2^32-1个元素，可以支持取交集并集差集
+
+**set与list的区别：**
+
+- set只能存储非重复元素、list可以存储重复元素
+- list是按照元素的先后顺序存储，set无序存储
+
+### 底层实现
 
 底层为哈希表或整数集合
 
 - 列表的元素<512个（可配置），并且每个元素的值小于64字节，redis会使用整数集合
 - 其他情况用哈希表
+
+### 命令
+
+```sql
+# 往集合key中存入元素，存在则忽略，不存在则新建
+SADD key member [member …]
+# 删除
+SREM key member [member …]
+# 获取所有元素
+SMEMBERS key
+# 获取集合key中的元素个数
+SCARD key
+
+# 判断member元素是否存在
+SISMEMBER key member
+
+# 从集合key中随机选出count个元素，不从key中删除
+SRANDMEMBER key [count]
+# 从集合key中随机选取count个元素，从key中删除
+SPOP key [count]
+
+# 交集运算
+SINTER key [key …]
+# 求交集并存入新集合destination
+SUNIONSTORE destination key [key …]
+
+# 差集运算
+SDIFF key [key …]
+# 将差集结构存入新集合destination中
+SDIFFSTORE destination key [key …]
+
+```
+
+### 应用场景
+
+适用于数据去重和保障数据的唯一性，统计集合交并集等
+
+但set求差并交的计算复杂度较高，容易造成阻塞，因此在主从集合中，可以用从库完成聚合统计、或者返回给客户，客户端完成聚合统计
+
+1、点赞
+
+set能保证一个用户只能点一个赞，例如key是文章id，value是用户id
+
+```sql
+# 用户123对文章点赞
+SADD article:1 uid:1
+SADD article:1 uid:2
+SADD article:1 uid:3
+# 取消了点赞
+SREM article:1 uid:1
+# 获取所有点赞
+SMEMBERS article:1 # 获取所有点赞的人
+SCARD article:1 # 获取点赞的用户数量
+# 判断用户是否对文章点赞了
+SISMEMBER article:1 uid:1
+```
+
+2、共同关注
+
+用交集运算计算共同关注的好友、公众号
+
+3、抽奖活动
+
+存储活动中中奖的用户名，确保不会一个用户中奖两次，随机取函数可以用于抽奖
+
+```sql
+SADD lucky Tom Jerry John Sean Marry Lindy Sary Mark
+# 抽取1个一等奖
+SRANDMEMBER lucky 1
+# 抽取2个er'd
+```
+
+
+
+
+
+
+
+
 
 ## ZSet类型
 
