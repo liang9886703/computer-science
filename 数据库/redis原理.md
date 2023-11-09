@@ -357,7 +357,7 @@ SISMEMBER article:1 uid:1
 SADD lucky Tom Jerry John Sean Marry Lindy Sary Mark
 # 抽取1个一等奖
 SRANDMEMBER lucky 1
-# 抽取2个er'd
+# 抽取2个二等奖
 ```
 
 
