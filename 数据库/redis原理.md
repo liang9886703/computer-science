@@ -51,6 +51,79 @@ HyperLogLog比起set占用更小空间，仅实现基数统计，对于2^64个�
 
 stream比起list，自动生成全局唯一消息ID，支持以消费组形式消费数据
 
+## 底层数据结构
+
+### listpack
+
+#### 结构
+
+对于链表，采用跳表的方式每一层的指针占用了空间，因此用紧凑列表
+
+紧凑列表，用连续的内存空间保存数据，用不同的编码方式保存不同长度的数据，listpack将字符串列表进行序列化存储
+
+**listpack构成：**由四部分组成
+
+- total bytes：表示整个listpack的空间大小，占用4个字节
+- num elem：表示元素个数，即entry的个数，占用2个字节，超过2个字节的元素个数也可以存放，只是要遍历整个listpack
+- entry为具体的元素
+- end为listpack结束标志，1字节，内容为0xFF
+
+**entry结构**
+
+- 编码类型encoding type
+- 数据data
+- 前两部分的长度element-tot-len（<=5字节）,第一个bit用于标识，0标识结束，1表示未结束，每个字节只有7bit有效
+
+其中data部分的数据如果很短可以放在type字段中
+
+通过element-tot-len可以计算出type和data的总长度从而找到上一个元素的首地址
+
+**type编码方式**
+
+对于小的数字：用1字节表示
+
+`0|xxxxxxx`
+
+对于小的字符串：6位字符串长度，后面是字符串内容
+
+`10|xxxxxx <string-data>`
+
+多字节编码：
+
+```c
+110|xxxxx yyyyyyyy  //表示无符号整型数据，后5位+下个字节共13bit表示数据
+1110|xxxx yyyyyyyy  //表示12位长度的字符串，后4位+下个字节用来表示字符串长度，再之和为字符串数据
+```
+
+```c
+1111|0000 <4 bytes len> <large string>//即32位长度字符串，后4字节为字符串长度，再之后为字符串内容
+1111|0001 <16 bits signed integer>//即16位整型，后2字节为数据
+1111|0010 <24 bits signed integer>//即24位整型，后3字节为数据
+1111|0011 <32 bits signed integer>//即32位整型，后4字节为数据
+1111|0100 <64 bits signed integer>//即64位整型，后8字节为数据
+1111|0101 to 1111|1110    //当前不用
+1111|1111 End of listpack，//结尾标识
+```
+
+@避免连锁更新的实现方式
+
+每个列表只记录自己的长度，不会像ziplist中的列表项那样记录前一项的长度。当在修改或新增元素时，只会涉及每个列表项自己的操作，不影响后续列表项的长度变化，从而避免连锁更新
+
+#### 查询
+
+正向查询：listpack保存了LP_HDR_SIZE，用于吧指针移到第一个entry列表项
+
+1. listpack的结构记录了编码类型，从而得知encoding+data的总长度len1
+2. 通过len1计算出element-tot-len的长度
+3. len1+element-tot-len之和为entry的总长度len
+4. 向后移动总长度len即为下应该列表项的起始位置
+
+反向查询：
+
+
+
+
+
 ## string类型
 
 是kv结构，value最多容纳数据512M
@@ -391,12 +464,262 @@ SRANDMEMBER lucky 1
 
 ## ZSet类型
 
-底层用压缩列表或跳表
+### 底层实现
+
+底层用压缩列表或跳表，比起set多了排序属性，每个元素由两个值构成，一个是排序（score）值，一个是元素值
 
 - 集合的元素<128个（可配置），并且每个元素的值小于64字节，redis会使用压缩列表
 - 其他情况用跳表
 
 redis 7.0后压缩列表用listpack实现
+
+### 命令
+
+```sql
+# 往有序集合key中加入带分值元素
+ZADD key score member [[score member]……]
+# 往有序集合key中删除元素
+ZREM key member [member ……]
+# 返回有序集合key中元素member的分值
+ZSCORE key member
+# 返回有序集合key中元素的个数
+ZCARD key
+
+# 为有序集合key中元素member的分值加上increment
+ZINCRBY key increment member
+
+# 获取有序集合key从start到stop下标的元素
+ZRANGE key start stop [WITHSCORES]# 正序
+ZREVRANGE key start stop [WITHSCORES]# 倒序
+
+# 返回指定分数区间内的成员，分数由低到高
+ZRANGEBYSCORE key min max [WITHSCORES][LIMIT offset count]
+
+# 返回指定成员区间内的成员，分数必须相同
+ZRANGEBYLEX key min max [LIMIT offset count]# 按字典正序排列
+ZREVRANGEBYLEX key min max [LIMIT offset count]# 按字典逆序排列
+
+# 并集计算(相同元素分值相加)，numberkeys一共多少个key，WEIGHTS每个key对应的分值乘积
+ZUNIONSTORE destkey numberkeys key [key...] 
+# 交集计算(相同元素分值相加)，numberkeys一共多少个key，WEIGHTS每个key对应的分值乘积
+ZINTERSTORE destkey numberkeys key [key...]
+```
+
+### 应用场景
+
+Zset类型可以根据元素的权重来排序，面对需要分页展示最新列表（以时间作为权重）、排行榜等场景
+
+**排行榜**
+
+以博文点赞排名，
+
+对于新增一个点赞，可以用`ZINCRBY user:xiaolin:ranking 1 arcticle:4`
+
+查看赞数，可以用`ZSCORE user:xiaolin:ranking arcticle:4`
+
+获取赞数最多的三篇文章，`ZREVRANGE user:xiaolin:ranking 0 2 WITHSCORES`
+
+**电话、姓名排序**
+
+## BitMap
+
+位图，适用于数据量大且使用二值统计的场景
+
+### 内部实现
+
+本身用string类型作为底层数据结构，string保存为二进制的字节数组
+
+### 命令
+
+```sql
+# 设置key表的第offset位，value只能是0或1
+SETBIT key offset value
+# 获取值
+GETBIT key offset
+# 获取指定范围为1的个数
+BITCOUNT key start end
+# 作位运算
+BITOP [operations][result][key1][keyn]
+# operations:
+    # AND &
+    # OR |
+    # XOR ^
+    # NOT ~
+# result
+	# 计算的结果存储在该key中
+# key1 keyn，为参与运算的key范围，not只能有一个key
+
+# 返回指定key中第一次出现指定value(0/1)的位置
+BITPOS [key][value]
+```
+
+### 应用场景
+
+**签到统计**
+
+记录一个用户的签到情况
+
+记录该用户，6月3号（3的下标是2）的签到值为1  `SETBIT uid:sign：100:202206 2 1`
+
+检查该用户6月3号是否签到 `GETBIT uid:sign:100 :202206 2`
+
+统计该用户在6月的签到次数      `BITCOUNT uid:sign：100:202206`
+
+**判断用户登录态**
+
+对于5000万用户只需6MB空间
+
+**连续签到用户统计**
+
+统计连续7天打卡用户总数
+
+将每天的日期作为Bitmap的key，userId作为offset，即有7个Bitmap
+
+对这7个Bitmap作与运算，得到的Bitmap对应的offset为1就表示这个用户连续7天打卡了
+
+## HyperLogLog
+
+统计基数的数据类型，非准确统计，基于概率的统计，误算率为0.81%
+
+对于大量的数据的统计所需的内存空间固定且较小，12KB的内存可以算2^64个不同元素的基数
+
+### 使用
+
+```sql
+# 添加指定元素
+PFADD key element [element ……]
+# 返回给定的HyperLogLog基数
+PFCOUNT key [key ……]
+# 将多个HyperLogLog合并为一个HyperLogLog
+PFMERGE destkey sourcekey [……]
+```
+
+### 应用场景
+
+**百万级网页UV计数**
+
+### GEO
+
+存储地理位置
+
+### 内部实现
+
+使用了Sorted Set集合类型，实现了经纬度到Sorted Set集合中的权重分数的转换
+
+对二维地图作区间划分，并对区间进行编码
+
+### 应用场景
+
+滴滴打车
+
+## stream
+
+专门为消息队列设计的数据类型
+
+传统的消息队列存在一些问题：
+
+- 发布订阅模式不能持久化，对于离线重连的客户端不能读取消息
+- list实现消息队列的方式不能重复消费，消费后就会被删除，并且生产者需要自行实现全局唯一ID
+
+@发布订阅模式为什么不能作为消息队列
+
+- 发布/订阅机制没有基于数据类型实现，所以不会写入RDB和AOF中，不具备数据持久化的能力
+- 订阅者离线重连后不能消费之前的历史消息
+- 消费端有消息积压时，如果超过32M或60s保持8M以上，消费端会被强行断开
+
+所以，发布/订阅机制只适合即时通讯的场景
+
+### 命令使用
+
+```SQL
+# 往message队列中插入消息，键为key，值为value
+# *表示生成ID，保证有序并生成全局唯一
+XADD message * key value
+>1654254953807-0
+
+# XDEL:根据消息ID删除消息
+
+# 读取消息，读取流message里ID为1654254953807-0以后的消息，不包括当前ID
+XREAD STREAMS message 1654254953807-0
+# 对于阻塞读，读取最新消息，如果没有消息到来，将阻塞10s再返回
+XREAD BLOCK 10000 STREAMS message
+```
+
+### 应用场景-消息队列
+
+插入成功的数据会返回全局唯一的ID，这个ID第一部分为当前服务器的时间，第二部分为当前ms内的消息序号，从0开始编号
+
+**消费组**
+
+```sql
+# 用消息队列message创建一个名为group1的消费组，0-0表示从第一条消息开始读取
+XGROUP CREATE message group1 0-0
+XGROUP CREATE message group2 0-0
+
+# 只写入一条消息
+XADD message * name sonkken
+
+# 读取
+XREADGROUP GROUP group1 consumer1 STREAMS message # 可以读到消息
+XREADGROUP GROUP group2 consumer2 STREAMS message # 可以读到消息
+# 此时再读取group1,group2将读的NULL值
+
+```
+
+消息队列中的消息一旦被消费组读取了，就不能再被该消费组的其他消费者读取，但不同消费组的消费这可以消费同一条消息
+
+使用消费组可以让多个消费者分担读取消息
+
+```sql
+# 让consumer1、2、3各自读取group2的一条消息
+XREADGROUP GROUP group2 consumer1 COUNT 1 STREAMS message
+XREADGROUP GROUP group2 consumer2 COUNT 1 STREAMS message
+XREADGROUP GROUP group2 consumer3 COUNT 1 STREAMS message
+```
+
+@ 如何保证消费者发生故障重启后仍能读取未处理完的消息
+
+streams会自动使用内部队列（PENDING List）留存消费组里每个消费者读取的消息，直到消费者使用XACK命令通知streams消息处理完成
+
+```sql
+# 查看message中group2的消息个数
+XPENDING message group2
+# 查看消费者具体读了哪些数据
+XPENDING message group2 - + 10 consumer2
+
+#用XACK命令通知streams删除消息
+XACK message group2 xiaoxiID
+```
+
+@ stream消息会丢失吗
+
+在生产者和消费者部分不会丢失消息，在中间件部分会丢失：
+
+- AOF持久化配置为每秒写盘，这个过程是异步的，redis宕机时可能丢失数据
+- 主从复制也是异步的，主从切换时可能丢失数据
+
+像RabbitMQ或Kafka这类专业的队列中间件，生产者发布消息时，中间件会写多个节点，一个节点挂了集群数据不丢失
+
+@stream消息可堆积吗
+
+redis作为内存数据库，消息积压超过内存上限会面临OOM风险，所以redis的stream提供指定队列最大长度的功能，超过上限时，旧消息会被删除
+
+**因此将redis作为消息队列使用可能面临：**
+
+- redis的数据丢失
+- 面对消息挤压，内存资源紧张
+
+因此如果业务简单，可以使用，但如果业务有海量消息，不能接收数据丢失，应该用专业的消息队列中间件
+
+
+
+
+
+
+
+
+
+
 
 # redis线程模型
 
@@ -927,4 +1250,58 @@ redis-cli -h 127.0.0.1 -p6379 -a "password" -- bigkeys
 - lazyfree-lazy-eviction : 当运行内存超过maxmeory开启
 - lazyfree-lazy-expire：对于设置了过期时间的键值，过期之后是否开启
 - lazyfree-lazy-server-del：一些指令内存实现带有隐式的del操作（比如rename），在这种场景下是否开启
-- 
+- slave-lazy-flush：从节点作数据同步时，在加载master的RDB文件时，会先清理自己的数据，在时是否开启
+
+## redis管道的作用
+
+管道是客户端提供的批处理技术用于一次处理多个redis命令，将多个命令整合到一起发送给服务端处理后统一返回。要避免发送的命令过大而阻塞网络
+
+## redis事务支持回滚吗
+
+没有提供回滚，事务的执行，对于已经正确执行的部分，当当前事务终止，不能回退正确执行的部分，即并不保证事务的原子性
+
+原因是，redis事务的执行一般不会发生错误，通常错误都是由编程错误导致，而非实际应用出现，不需要增加这个功能
+
+同时事务回滚这种复杂的功能违背了redis追求的简单高效
+
+## redis实现分布式锁
+
+用string类型存放锁，需要满足三个条件
+
+1. set命令带上nx选项来实现读取并写入锁值
+2. 锁要设置过期时间，避免客户端拿到锁后发生异常导致锁一直无法释放，EX/PX选项
+3. 锁变量要能区分不同客户端的加锁操作
+
+`set lock_key unique_value NX PX 10000`
+
+对于解锁，需要先比较客户端unique_value的值再修改值，这个过程使用Lua脚本保证操作的原子性
+
+优点：
+
+1. 性能高效
+2. 实现方便
+3. 避免单点故障（redis是跨集群部署的）
+
+缺点：
+
+1. 超时时间不好设置，过长影响性能，过短无法保护到共享资源
+
+   可以基于续约的方式设置超时时间，启动应该守护线程，在一段时间后重置这个锁的超时时间，主线程执行完后，终止这个守护线程
+
+2. 主从复制模式中的数据是异步复制的，这将导致分布式锁的不可靠。如果主节点获取到锁后没有同步到其他节点时redis主节点宕机了，此时新的redis主节点依然可以获取锁
+
+---
+
+**@红锁：**
+
+为了解决集群下分布式锁的可靠性问题，redis提供了分布式锁算法redlock（红锁）
+
+官方推荐部署5个redis主节点，均为孤立节点，让客户端和多个独立的redis节点依次请求申请加锁，如果过半能完成加锁操作就认为能够加锁，否则加锁失败
+
+redlock算法加锁的三个过程
+
+1. 客户端获取当前时间t1
+2. 客户端按顺序依次向N个redis节点执行加锁操作，同时加锁操作设置一个时间上限（避免某个节点发生故障时，redlock依然能正常运行，通常为几十ms）
+3. 如果过半获取到了锁，再获取当前时间（t2），计算整个加锁的总耗时（t2-t1)，
+4. 如果获取锁的总耗时小于锁设置的过期时间，并且剩下的时间能够完成数据的操作则成功获取到了锁，否则认为锁过期 
+5. 如果加锁失败，客户端向所有redis节点发起释放锁的操作
