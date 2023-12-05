@@ -33,29 +33,261 @@ etcd更为可靠安全，故障转移和持续数据可用，数据均持久化
 
 # 数据结构
 
-**支持的数据类型和应用场景**：
+redis的所有对象都用redisObject保存
 
--  String(字符串)：缓存对象、分布式锁、共享session信息
--  Hash(哈希)：缓存对象、例如：购物车
--  List (列表)：消息队列
--  Set(集合)：聚合（交并差）计算，例如：共同关注
--  Zset(有序集合)：排序场景
--  Bitmaps（位图）：二值状态的统计，例如：签到、判断登录状态
--  HyperLogLog（基数统计）：例如：网页UV计数（独立访客统计）
--  GEO（地理信息）：储存地理位置信息的场景
--  Stream（流）：消息队列
+```cpp
+struct redisObject{
+    unsigned type:4;//对象的类型
+    unsigned encoding:4;//具体的编码方式，embstr、sds
+    unsigned lru:LRU_BITS;//24位，表示对象最后一次被程序访问的时间，和内存回收有关
+    int refcount;//引用计数，4字节
+    void *ptr;//指向对象实际的数据结构，8字节
+}//总共16字节
+```
 
-HyperLogLog比起set占用更小空间，仅实现基数统计，对于2^64个不同元素的基数只需用12KB的内存，结果的误差在一定范围内
+**redis整体上是一个键值对数据库**，非关系型数据库
 
-例如：数据集{1，3，5，7，5，7，8}的基数集为{1，3，5，7，8}，基数为5
+key为字符串对象，value可以是string、list、hash、set、zset
 
-stream比起list，自动生成全局唯一消息ID，支持以消费组形式消费数据
+```sql
+SET name "redis"# 键为name，值为redis，string类型
+HSET person name "redis" age 18 # 哈希表键，键为person，值为两个键值对
+RPUSH stu "redis" "01" # 列表键，键为stu，值是一个包含两个元素的列表对象
+```
 
-## 底层数据结构
+对于这些键值对，redis统一使用哈希表来保存所有键值对，一个哈希桶存放的是指向键值对数据的指针，通过指针找到键值对数据，键值对数据再保存指向实际数据对的指针
 
-### listpack
+## 哈希表结构
 
-#### 结构
+![image-20231124101640025](image-20231124101640025.png)
+
+hash数据类型用的是哈希表+listpack实现
+
+哈希表底层用的拉链法解决冲突
+
+```c
+typedef struct dictht {
+    //哈希表数组
+    dictEntry **table;//一个数组，每个元素指向哈希表节点的指针
+    //哈希表大小
+    unsigned long size;  
+    //哈希表大小掩码，用于计算索引值
+    unsigned long sizemask;
+    //该哈希表已有的节点数量
+    unsigned long used;
+} dictht;
+```
+
+```c
+typedef struct dictEntry {
+    //键
+    void *key;
+    //值
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v;
+    //指向下一个哈希表节点，形成链表
+    struct dictEntry *next;
+} dictEntry;
+```
+
+拉链法解决冲突时，长期使用导致一个冲突的哈希桶有太多值，冲突概率增大，因此需要rehash来定期维护哈希表
+
+### rehash
+
+```c
+typedef struct dict{
+    ……
+   	//两个哈希表交替使用
+    dictht ht[2];
+}dict;
+```
+
+
+
+
+
+
+
+
+
+
+字符串对象的内部编码有三种：int、raw、embstr
+
+## int类型的编码方式
+
+- 保存对象是整数值
+- 可以被long类型标识
+
+那么会将整数值保存在字符串对象结构的ptr属性里，编码设置为int
+
+![image-20231104164254447](image-20231104164254447.png)
+
+## SDS（simple dynamic string)
+
+来表示string字符串数据类型
+
+**c语言字符串的缺陷**
+
+- 获取字符串长度的时间复杂度为O(N)
+- 字符串不能含有“\0”,即只能放文本数据，不能保存二级制数据
+- c语言标准库中字符串的操作函数是不安全、不高效
+
+### SDS结构
+
+```c
+//sdshdr8
+struct __arrtibute__ ((__packed__)) sdshdr8{
+    uint8_t len;//实际使用的字符串长度，1字节
+    uint8_t alloc;//分配的内存大小，1字节，
+    unsigned char flags;//表示是sdshdr几，1字节，实际只用了3位，
+    char buf[44];//指向实值，44字节
+}//共47字节，
+```
+
+sds分成多种，sdshdr5、sdshdr8、sdshdr16、sdshdr32、dsdhdr64用于存储不同长度的字符串，即len和alloc成员变量的数据类型不同，sdshdr几，代表uint为多少位。sdshdr16，则len和alloc为uint16_t类型。
+
+`__arrtibute__` 表示取消结构体在编译过程中的优化对齐，按照实际占用字节数对齐
+
+采用SDS结构的编码方式有两种embstr和raw
+
+### embstr类型的编码方式
+
+专用于保存短字符串
+
+- 保存的是一个字符串
+- 字符串长度<=44字节（redis5.0）
+
+将使用简单动态字符串SDS来保存这个字符串，并将对象的编码设置为embstr
+
+字符串对象结构里保存SDS的数据信息，用buf指针指向实值
+
+![image-20231104164756548](image-20231104164756548.png)
+
+redisObject结构
+
+```cpp
+struct redisObject{
+    unsigned type:4;//对象的类型
+    unsigned encoding:4;//具体的编码方式，embstr、sds
+    unsigned lru:LRU_BITS;//24位，表示对象最后一次被程序访问的时间，和内存回收有关
+    int refcount;//引用计数，4字节
+    void *ptr;//指向对象实际的数据结构，8字节
+}//总共16字节
+```
+
+SDS结构sdshdr
+
+```cpp
+struct __arrtibute__ ((__packed__)) sdshdr8{
+    uint8_t len;//实际使用的字符串长度，1字节
+    uint8_t alloc;//分配的内存大小，1字节，
+    unsigned char flags;//表示是sdshdr几，1字节，实际只用了3位，
+    char buf[44];//指向实值，44字节
+}//共47字节，
+```
+
+redisObject(16) + SDS(47) + 结束符\0（1）=64
+
+sdshdr会分配8，16，32，64字节的内存
+
+### raw类型的编码方式
+
+- 保存的是字符串
+- 字符串长度>44字节（redis5.0)
+
+用SDS来保存这个字符串，并将对象的编码设置为raw
+
+ptr指向SDS的数据信息，用buf指针指向实值
+
+![image-20231104165041851](image-20231104165041851.png)
+
+### raw相比embstr
+
+embstr一次分配一块连续的内存空间来保存redisObject和SDS
+
+raw编码通过调用两次内存分配函数来分别分配两块空间来保存redisObject和SDS
+
+embstr优点
+
+- embstr有更少的内存分配和释放次数
+- 连续的内存空间有更好的查询效率
+
+embstr缺点
+
+- 字符串长度增加时，redisObject和sds都需要重新分配空间
+
+> 因此embstr编码的字符串对象实际上是只读的，没有修改它的程序，如果要修改，会将其转为raw再修改
+
+### **SDS优点**
+
+redis的SDS结构在原本字符数组上，增加了三个元数据来解决c语言字符串的缺陷。
+
+1. 二级制安全：SDS为了兼容c标准库函数，依然在结尾加上“\0”字符。同时程序不会对其中的数据做任何限制，数据写入和读取是一样的
+2. O（1)复杂度获取字符串长度
+3. 不会发生缓冲区溢出：alloc和len可以计算出剩余空间的大小，自动扩容
+
+### **扩容策略**
+
+sds长度小于1MB，翻倍扩容
+
+sds长度超过1MB，依次增加1MB
+
+## 压缩列表ziplist
+
+### 优缺
+
+优点：
+
+- 采用连续的内存空间，利用上了cpu缓存
+- 对不同长度的数据采用不同的编码，节省内存开销
+
+缺点：
+
+- 元素的增加会降低查询效率
+- 新增或修改元素时内存空间需要重新分配、
+- 新增或修改元素可能引发连锁更新
+
+### 结构设计
+
+![image-20231124110938019](image-20231124110938019.png)
+
+由如下五部分构成
+
+- zlbytes 记录整个压缩列表占用内存字节数
+- zltail 记录到表尾的偏移量
+- zllen 记录压缩列表包含的节点数量
+- entry 实际的值
+- zlend 列表的结束点，固定0xFF
+
+**entry结构**
+
+- prevlen 记录前一个节点的长度，用于从后往前遍历，
+  - 如果前一个节点长度小于254，则用1字节来保存长度，
+  - 如果大于等于254字节，用5字节来保存长度
+- encoding，记录当前节点实际数据的类型和长度 （字符串和整数）
+- data 实际数据
+
+encoding部分和listpack类似
+
+### 连锁更新
+
+新增元素或修改元素时，如果空间不够，压缩列表需要重新分配空间，想象一个压缩列表目前所有元素的长度都是253字节
+
+原本下个元素的上个元素小于254，下个元素用1字节保存长度，
+
+插入一个大元素时，下个元素用5个字节prevlen来保存长度，即下个元素的长度整体扩大了4个字节，超过了254，迫使下下个元素的prevlen字节也要扩容，这样连锁下去
+
+![image-20231124113010853](image-20231124113010853.png)
+
+
+
+## listpack
+
+### 结构
 
 对于链表，采用跳表的方式每一层的指针占用了空间，因此用紧凑列表
 
@@ -109,7 +341,7 @@ stream比起list，自动生成全局唯一消息ID，支持以消费组形式�
 
 每个列表只记录自己的长度，不会像ziplist中的列表项那样记录前一项的长度。当在修改或新增元素时，只会涉及每个列表项自己的操作，不影响后续列表项的长度变化，从而避免连锁更新
 
-#### 查询
+**查询**
 
 正向查询：listpack保存了LP_HDR_SIZE，用于吧指针移到第一个entry列表项
 
@@ -120,9 +352,40 @@ stream比起list，自动生成全局唯一消息ID，支持以消费组形式�
 
 反向查询：
 
+element-tot-len的第一位为1表示没有结束，左边字节仍然为element-tot-len的内容，第一位为0表示结束，element-tot-len的低7位采用大端模式存储
 
+element-tot-len记录了这个字节的长度，即上个字节的地址
 
+**删除**
 
+用空元素替换
+
+**改和插入**
+
+1. 计算插入后的整个listpack空间，通过realloc申请空间
+2. 调整新listpakc中老元素的位置，加入新元素
+3. 释放旧listpack
+4. 更新新listpack信息
+
+# 数据类型
+
+**支持的数据类型和应用场景**：
+
+-  String(字符串)：缓存对象、分布式锁、共享session信息
+-  Hash(哈希)：缓存对象、例如：购物车
+-  List (列表)：消息队列
+-  Set(集合)：聚合（交并差）计算，例如：共同关注
+-  Zset(有序集合)：排序场景
+-  Bitmaps（位图）：二值状态的统计，例如：签到、判断登录状态
+-  HyperLogLog（基数统计）：例如：网页UV计数（独立访客统计）
+-  GEO（地理信息）：储存地理位置信息的场景
+-  Stream（流）：消息队列
+
+HyperLogLog比起set占用更小空间，仅实现基数统计，对于2^64个不同元素的基数只需用12KB的内存，结果的误差在一定范围内
+
+例如：数据集{1，3，5，7，5，7，8}的基数集为{1，3，5，7，8}，基数为5
+
+stream比起list，自动生成全局唯一消息ID，支持以消费组形式消费数据
 
 ## string类型
 
@@ -134,86 +397,35 @@ stream比起list，自动生成全局唯一消息ID，支持以消费组形式�
 - 获取字符串长度的时间复杂度是O（1）
 - SDS的API是安全的，拼接字符串会自动扩容
 
-字符串对象的内部编码有三种：int、raw、embstr
+### 命令
 
-### int类型的编码方式
+```sql
+# 设置key-value类型的值
+SET name lin
+MSET key1 value1 key2 value2
 
-- 保存对象是整数值
-- 可以被long类型标识
+# 根据key获得value
+GET name 
+MGET key1 key2
 
-那么会将整数值保存在字符串对象结构的ptr属性里，编码设置为int
+# 判断key是否存在
+EXISTS name
+# 返回key所存储的字符串值的长度
+STRLEN name
+# 删除某个key对应的值
+DEL name
 
-![image-20231104164254447](image-20231104164254447.png)
+# 设置租约为60s
+EXPIRE name 60
+# 查看数据还要多久过期
+TTL name
 
-### embstr类型的编码方式
-
-专用于保存短字符串
-
-- 保存的是一个字符串
-- 字符串长度<=44字节（redis5.0）
-
-将使用简单动态字符串SDS来保存这个字符串，并将对象的编码设置为embstr
-
-字符串对象结构里保存SDS的数据信息，用buf指针指向实值
-
-![image-20231104164756548](image-20231104164756548.png)
-
-sds分成多种，sdshdr5、sdshdr8、sdshdr16、sdshdr32、dsdhdr64用于存储不同长度的字符串，这里没看懂，不指定实际怎么用的
-
-redisObject结构
-
-```cpp
-struct redisObject{
-    unsigned type:4;//对象的类型
-    unsigned encoding:4;//具体的编码方式，embstr、sds
-    unsigned lru:LRU_BITS;//24位，表示对象最后一次被程序访问的时间，和内存回收有关
-    int refcount;//引用计数，4字节
-    void *ptr;//指向对象实际的数据结构，8字节
-}//总共16字节
+# 设置key-value类型的值，并设置过期时间
+SET key value EX 60
+SETEX key 60 value
 ```
 
-SDS结构sdshdr8
 
-```cpp
-struct __arrtibute__ ((__packed__)) sdshdr8{
-    uint8_t len;//实际使用的字符串长度，1字节
-    uint8_t alloc;//分配的内存大小，1字节
-    unsigned char flags;//表示是sdshdr几，1字节，实际只用了3位，
-    char buf[44];//指向实值，44字节
-}//共47字节，
-```
-
-​	redisObject(16) + SDS(47) + 结束符\0（1）=64
-
-sdshdr会分配8，16，32，64字节的内存
-
-### raw类型的编码方式
-
-- 保存的是字符串
-- 字符串长度>44字节（redis5.0)
-
-用SDS来保存这个字符串，并将对象的编码设置为raw
-
-ptr指向SDS的数据信息，用buf指针指向实值
-
-![image-20231104165041851](image-20231104165041851.png)
-
-### raw相比embstr
-
-embstr一次分配一块连续的内存空间来保存redisObject和SDS
-
-raw编码通过调用两次内存分配函数来分别分配两块空间来保存redisObject和SDS
-
-embstr优点
-
-- embstr有更少的内存分配和释放次数
-- 连续的内存空间有更好的查询效率
-
-embstr缺点
-
-- 字符串长度增加时，redisObject和sds都需要重新分配空间
-
-> 因此embstr编码的字符串对象实际上是只读的，没有修改它的程序，如果要修改，会将其转为raw再修改
 
 ### 应用场景
 
